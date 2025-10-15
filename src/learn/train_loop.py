@@ -11,10 +11,11 @@ from typing import Dict, Iterable, Optional
 
 import logging
 import math
+import contextlib
 
 import torch
 from torch import nn
-from torch.cuda.amp import GradScaler, autocast
+from torch.amp import GradScaler, autocast
 
 from src.data.stream import StreamRecord
 from src.eval.metrics import MetricsAccumulator
@@ -84,7 +85,12 @@ class PhaseATrainer:
 
         self.use_amp = cfg.use_amp and torch.cuda.is_available()
         self.amp_dtype = cfg.amp_dtype if isinstance(cfg.amp_dtype, torch.dtype) else torch.float16
-        self.scaler = GradScaler(enabled=self.use_amp and cfg.use_grad_scaler)
+        trainable_is_fp32 = all((p.dtype == torch.float32) for p in self._trainable_params if p.requires_grad)
+        scaler_enabled = self.use_amp and cfg.use_grad_scaler and trainable_is_fp32
+        if not scaler_enabled and self.use_amp and cfg.use_grad_scaler:
+            logger.warning("GradScaler disabled (trainable params not float32).")
+        self.scaler = GradScaler(enabled=scaler_enabled) if scaler_enabled else None
+        self.scaler_enabled = scaler_enabled
 
         if self.teacher_head is not None:
             self._sync_teacher(self.ema_teacher if self.ema_teacher is not None else self.predictor)
@@ -129,8 +135,8 @@ class PhaseATrainer:
         need_hidden = self.residual_head is not None or (self.replay is not None)
         current_hidden: Optional[torch.Tensor] = None
 
-        with autocast(enabled=self.use_amp, dtype=self.amp_dtype):
-            logits_prev = self.predictor(prev_features)
+        with autocast(device_type="cuda", dtype=self.amp_dtype, enabled=self.use_amp):
+            logits_prev = self.predictor(prev_features)["logits"]
             if need_hidden:
                 input_ids = torch.tensor([record.tokens], device=self.device, dtype=torch.long)
                 _, aux_cur = self.trunk(input_ids=input_ids, attention_mask=None, use_cache=False)
@@ -212,12 +218,11 @@ class PhaseATrainer:
 
     def _enqueue_prediction(self, record: StreamRecord) -> None:
         input_ids = torch.tensor([record.tokens], device=self.device, dtype=torch.long)
-        with autocast(enabled=self.use_amp, dtype=self.amp_dtype):
+        with autocast(device_type="cuda", dtype=self.amp_dtype, enabled=self.use_amp):
             logits, aux = self.trunk(input_ids=input_ids, attention_mask=None, use_cache=True)
             hidden_states = aux["hidden_states"]
             last_hidden = hidden_states[:, -1, :]
-            pred_outputs = self.predictor(last_hidden)
-            logits_pred = pred_outputs["logits"]
+            logits_pred = self.predictor(last_hidden)["logits"]
         target_dtype = self.predictor.decoder.weight.dtype
         last_hidden = last_hidden.to(device=self.device, dtype=target_dtype)
 
@@ -247,7 +252,7 @@ class PhaseATrainer:
             features = payload["features"].to(self.device, dtype=self.predictor.decoder.weight.dtype)
             target = payload["target"].to(self.device)
 
-            with autocast(enabled=self.use_amp, dtype=self.amp_dtype):
+            with autocast(device_type="cuda", dtype=self.amp_dtype, enabled=self.use_amp):
                 logits = self.predictor(features)["logits"]
             loss_terms: Dict[str, torch.Tensor] = {
                 "prediction": losses.prediction_loss(logits.float().clamp(-20, 20), target)
