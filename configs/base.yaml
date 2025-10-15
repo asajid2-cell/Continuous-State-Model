@@ -1,0 +1,47 @@
+# Base configuration for delta-driven dual-stream LLM
+
+model:
+  base_name: TinyLlama/TinyLlama-1.1B-Chat-v1.0
+  revision: main
+  quantization: bitsandbytes-4bit
+  tokenizer_name: TinyLlama/TinyLlama-1.1B-Chat-v1.0
+  padding_side: left
+  torch_dtype: float16
+  lora:
+    r: 8
+    alpha: 16
+    dropout: 0.05
+    target_modules:
+      - q_proj
+      - k_proj
+      - v_proj
+      - o_proj
+      - gate_proj
+      - up_proj
+      - down_proj
+
+data:
+  stream_path: data/stream.jsonl
+  sequence_length: 1024
+  micro_batch_size: 1
+  gradient_accumulation_steps: 16
+
+predictor:
+  use_variance_head: false
+
+training:
+  adapter_lr: 2.0e-4
+  predictor_lr: 2.5e-4
+  weight_decay: 0.01
+  grad_clip: 1.0
+  ema_decay: 0.999
+  kl_weight: 0.02
+  consistency_weight: 0.1
+  residual_weight: 0.05
+  max_steps: 200
+
+logging:
+  project: delta-dual-stream
+  run_name: phase-a-prototype
+  log_interval: 50
+  eval_interval: 2000
