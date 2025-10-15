@@ -1,8 +1,5 @@
 ﻿"""
 Entry point for running the Phase A streaming training loop.
-
-Once the trunk loader and stream iterator are available this script will wire
-them together and launch the continual learning cycle.
 """
 
 from __future__ import annotations
@@ -22,11 +19,13 @@ if ROOT not in sys.path:
 import torch
 from torch.optim import AdamW
 
+torch.set_float32_matmul_precision("medium")
+
 from src.config import load_app_config
 from src.data.stream import stream_loader_factory
 from src.learn.train_loop import PhaseATrainConfig, PhaseATrainer
 from src.learn.replay import PrioritizedReplay
-from src.model.factory import create_predictor, create_residual, create_trunk
+from src.model.factory import create_predictor, create_residual, create_teacher, create_trunk
 
 logger = logging.getLogger("delta_stream.train")
 
@@ -36,6 +35,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--config", type=Path, default=Path("configs/base.yaml"))
     parser.add_argument("--log-level", type=str, default="INFO", help="Python logging level (DEBUG, INFO, WARNING, ...)")
     return parser.parse_args()
+
+
+def _resolve_amp_dtype(name: str) -> torch.dtype:
+    try:
+        return getattr(torch, name)
+    except AttributeError:
+        logger.warning("Unknown AMP dtype '%s', defaulting to float16", name)
+        return torch.float16
 
 
 def main() -> None:
@@ -76,6 +83,12 @@ def main() -> None:
             param.requires_grad_(False)
         logger.info("EMA teacher initialized for predictor consistency loss")
 
+    teacher_head = None
+    if app_cfg.training.kl_weight > 0:
+        source = ema_predictor if ema_predictor is not None else predictor
+        teacher_head = create_teacher(source)
+        logger.info("Float32 teacher head initialized for KL regularization")
+
     trunk_params = [p for p in trunk.base_model.parameters() if p.requires_grad]
     predictor_params_list = list(predictor.parameters())
     param_groups = [
@@ -85,7 +98,7 @@ def main() -> None:
     if residual_params:
         param_groups.append({"params": residual_params, "lr": app_cfg.training.predictor_lr})
 
-    optimizer = AdamW(param_groups, weight_decay=app_cfg.training.weight_decay)
+    optimizer = AdamW(param_groups, weight_decay=app_cfg.training.weight_decay, eps=app_cfg.training.adam_eps)
     total_params = sum(p.numel() for p in trunk_params) + sum(p.numel() for p in predictor_params_list) + sum(
         p.numel() for p in residual_params
     )
@@ -102,6 +115,10 @@ def main() -> None:
             replay_cfg.batch,
         )
 
+    amp_settings = app_cfg.training.amp
+    amp_enabled = bool(amp_settings.enabled and torch.cuda.is_available())
+    amp_dtype = _resolve_amp_dtype(amp_settings.dtype)
+
     phase_cfg = PhaseATrainConfig(
         kl_weight=app_cfg.training.kl_weight,
         consistency_weight=app_cfg.training.consistency_weight,
@@ -112,7 +129,11 @@ def main() -> None:
         grad_accum_steps=app_cfg.data.gradient_accumulation_steps,
         replay_interval=replay_cfg.interval,
         replay_batch=replay_cfg.batch,
+        use_amp=amp_enabled,
+        amp_dtype=amp_dtype,
+        use_grad_scaler=amp_settings.use_grad_scaler,
     )
+
     trainer = PhaseATrainer(
         cfg=phase_cfg,
         trunk=trunk,
@@ -120,6 +141,7 @@ def main() -> None:
         optimizer=optimizer,
         residual_head=residual_head,
         ema_teacher=ema_predictor,
+        teacher_head=teacher_head,
         replay=replay_buffer,
     )
 

@@ -51,6 +51,15 @@ class ReplaySettings:
 
 
 @dataclass
+class AmpSettings:
+    """Automatic mixed precision configuration."""
+
+    enabled: bool = False
+    dtype: str = "float16"
+    use_grad_scaler: bool = True
+
+
+@dataclass
 class TrainingSettings:
     """Optimization hyper-parameters for adapters and predictor."""
 
@@ -64,6 +73,8 @@ class TrainingSettings:
     residual_weight: float
     max_steps: int = 0
     replay: ReplaySettings = field(default_factory=ReplaySettings)
+    amp: AmpSettings = field(default_factory=AmpSettings)
+    adam_eps: float = 1.0e-6
 
 
 @dataclass
@@ -137,25 +148,33 @@ def load_app_config(path: Path) -> AppConfig:
         capacity=int(replay_cfg.get("capacity", 0)),
         alpha=float(replay_cfg.get("alpha", 0.6)),
     )
+    amp_cfg = training_cfg.get("amp", {})
+    amp_settings = AmpSettings(
+        enabled=bool(amp_cfg.get("enabled", False)),
+        dtype=amp_cfg.get("dtype", "float16"),
+        use_grad_scaler=bool(amp_cfg.get("use_grad_scaler", True)),
+    )
     training_settings = TrainingSettings(
         adapter_lr=float(training_cfg["adapter_lr"]),
         predictor_lr=float(training_cfg["predictor_lr"]),
         weight_decay=float(training_cfg["weight_decay"]),
         grad_clip=float(training_cfg["grad_clip"]),
         ema_decay=float(training_cfg["ema_decay"]),
-        kl_weight=float(training_cfg["kl_weight"]),
-        consistency_weight=float(training_cfg["consistency_weight"]),
-        residual_weight=float(training_cfg["residual_weight"]),
+        kl_weight=float(training_cfg.get("kl_weight", 0.0)),
+        consistency_weight=float(training_cfg.get("consistency_weight", 0.0)),
+        residual_weight=float(training_cfg.get("residual_weight", 0.0)),
         max_steps=int(training_cfg.get("max_steps", 0)),
         replay=replay_settings,
+        amp=amp_settings,
+        adam_eps=float(training_cfg.get("adam_eps", 1.0e-6)),
     )
 
     logging_cfg = raw.get("logging", {})
     logging_settings = LoggingSettings(
         project=logging_cfg["project"],
         run_name=logging_cfg["run_name"],
-        log_interval=int(logging_cfg["log_interval"]),
-        eval_interval=int(logging_cfg["eval_interval"]),
+        log_interval=int(logging_cfg.get("log_interval", 100)),
+        eval_interval=int(logging_cfg.get("eval_interval", 1000)),
     )
 
     return AppConfig(
