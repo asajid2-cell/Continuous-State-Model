@@ -15,7 +15,7 @@ from torch import nn
 
 cross_entropy_loss = nn.CrossEntropyLoss(reduction="mean")
 mse_loss = nn.MSELoss(reduction="mean")
-kl_div_loss = nn.KLDivLoss(reduction="batchmean")
+kl_div_loss = nn.KLDivLoss(reduction="batchmean", log_target=True)
 
 
 def prediction_loss(logits: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
@@ -24,10 +24,10 @@ def prediction_loss(logits: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
     return cross_entropy_loss(logits.view(-1, logits.size(-1)), target.view(-1))
 
 
-def consistency_loss(student_features: torch.Tensor, teacher_features: torch.Tensor) -> torch.Tensor:
-    """Mean squared error between student and EMA teacher features."""
+def consistency_loss(student_logits: torch.Tensor, teacher_logits: torch.Tensor) -> torch.Tensor:
+    """Mean squared error between student and teacher logits."""
 
-    return mse_loss(student_features, teacher_features)
+    return mse_loss(student_logits, teacher_logits)
 
 
 def residual_loss(delta: torch.Tensor, projected: torch.Tensor) -> torch.Tensor:
@@ -37,7 +37,7 @@ def residual_loss(delta: torch.Tensor, projected: torch.Tensor) -> torch.Tensor:
 
 
 def kl_guard(student_log_probs: torch.Tensor, base_log_probs: torch.Tensor) -> torch.Tensor:
-    """KL divergence that keeps the adapted model close to the frozen base."""
+    """KL divergence between student and teacher log probabilities."""
 
     return kl_div_loss(student_log_probs, base_log_probs)
 
@@ -46,4 +46,3 @@ def aggregate_losses(loss_terms: Dict[str, torch.Tensor]) -> torch.Tensor:
     """Sum weighted loss components into a scalar."""
 
     return torch.stack(list(loss_terms.values()), dim=0).sum()
-

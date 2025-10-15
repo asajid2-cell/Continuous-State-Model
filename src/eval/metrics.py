@@ -1,8 +1,5 @@
-"""
+﻿"""
 Evaluation helpers for monitoring residual cross-entropy, drift, and canary health.
-
-Phase A will rely on simple accumulators; richer dashboards will slot in once
-telemetry is wired up.
 """
 
 from __future__ import annotations
@@ -21,22 +18,25 @@ class MetricsAccumulator:
     total_tokens: int = 0
     updates: int = 0
     extras: Dict[str, float] = field(default_factory=dict)
+    extra_counts: Dict[str, int] = field(default_factory=dict)
 
     def update_cross_entropy(self, loss: torch.Tensor, tokens: int) -> None:
-        """Accumulate residual cross-entropy with token weighting."""
-
         self.total_ce += float(loss.item()) * tokens
         self.total_tokens += tokens
         self.updates += 1
 
-    def add_metric(self, name: str, value: float) -> None:
-        """Store custom metrics such as KL drift or gate suppression rate."""
-
-        self.extras[name] = value
+    def add_metric(self, name: str, value: float, accumulate: bool = True) -> None:
+        if accumulate:
+            self.extras[name] = self.extras.get(name, 0.0) + value
+            self.extra_counts[name] = self.extra_counts.get(name, 0) + 1
+        else:
+            self.extras[name] = value
+            self.extra_counts[name] = 1
 
     def summary(self) -> Dict[str, float]:
-        """Return current averages for reporting."""
-
         average_ce = self.total_ce / max(self.total_tokens, 1)
-        return {"avg_cross_entropy": average_ce, **self.extras}
-
+        metrics = {"avg_cross_entropy": average_ce}
+        for name, total in self.extras.items():
+            count = max(self.extra_counts.get(name, 1), 1)
+            metrics[name] = total / count
+        return metrics

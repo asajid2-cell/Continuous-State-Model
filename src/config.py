@@ -1,8 +1,5 @@
 ﻿"""
 Configuration loader for the delta-driven dual-stream project.
-
-Reads YAML config files and instantiates strongly typed dataclasses used across
-the training stack.
 """
 
 from __future__ import annotations
@@ -18,22 +15,16 @@ from src.model.trunk import LoraSettings, TrunkConfig
 
 @dataclass
 class ResidualSettings:
-    """Configuration for the residual projector head."""
-
     rank: int = 32
 
 
 @dataclass
 class PredictorSettings:
-    """Configuration toggles for the forward predictor head."""
-
     use_variance_head: bool = False
 
 
 @dataclass
 class DataSettings:
-    """Streaming data pipeline configuration."""
-
     stream_path: str
     sequence_length: int
     micro_batch_size: int
@@ -42,18 +33,15 @@ class DataSettings:
 
 @dataclass
 class ReplaySettings:
-    """Prioritized replay configuration."""
-
     interval: int = 0
     batch: int = 0
     capacity: int = 0
     alpha: float = 0.6
+    beta: float = 0.0
 
 
 @dataclass
 class AmpSettings:
-    """Automatic mixed precision configuration."""
-
     enabled: bool = False
     dtype: str = "float16"
     use_grad_scaler: bool = True
@@ -61,8 +49,6 @@ class AmpSettings:
 
 @dataclass
 class TrainingSettings:
-    """Optimization hyper-parameters for adapters and predictor."""
-
     adapter_lr: float
     predictor_lr: float
     weight_decay: float
@@ -72,15 +58,13 @@ class TrainingSettings:
     consistency_weight: float
     residual_weight: float
     max_steps: int = 0
+    adam_eps: float = 1.0e-6
     replay: ReplaySettings = field(default_factory=ReplaySettings)
     amp: AmpSettings = field(default_factory=AmpSettings)
-    adam_eps: float = 1.0e-6
 
 
 @dataclass
 class LoggingSettings:
-    """Telemetry configuration."""
-
     project: str
     run_name: str
     log_interval: int
@@ -89,14 +73,13 @@ class LoggingSettings:
 
 @dataclass
 class AppConfig:
-    """Top-level configuration bundle."""
-
     model: TrunkConfig
-    residual: Optional[ResidualSettings]
     predictor: PredictorSettings
     data: DataSettings
     training: TrainingSettings
     logging: LoggingSettings
+    residual: Optional[ResidualSettings] = None
+    seed: Optional[int] = None
 
 
 def _load_yaml(path: Path) -> Dict[str, Any]:
@@ -105,8 +88,6 @@ def _load_yaml(path: Path) -> Dict[str, Any]:
 
 
 def load_app_config(path: Path) -> AppConfig:
-    """Parse a YAML config file into an AppConfig instance."""
-
     raw = _load_yaml(path)
 
     model_cfg = raw.get("model", {})
@@ -147,6 +128,7 @@ def load_app_config(path: Path) -> AppConfig:
         batch=int(replay_cfg.get("batch", 0)),
         capacity=int(replay_cfg.get("capacity", 0)),
         alpha=float(replay_cfg.get("alpha", 0.6)),
+        beta=float(replay_cfg.get("beta", 0.0)),
     )
     amp_cfg = training_cfg.get("amp", {})
     amp_settings = AmpSettings(
@@ -164,9 +146,9 @@ def load_app_config(path: Path) -> AppConfig:
         consistency_weight=float(training_cfg.get("consistency_weight", 0.0)),
         residual_weight=float(training_cfg.get("residual_weight", 0.0)),
         max_steps=int(training_cfg.get("max_steps", 0)),
+        adam_eps=float(training_cfg.get("adam_eps", 1.0e-6)),
         replay=replay_settings,
         amp=amp_settings,
-        adam_eps=float(training_cfg.get("adam_eps", 1.0e-6)),
     )
 
     logging_cfg = raw.get("logging", {})
@@ -179,9 +161,10 @@ def load_app_config(path: Path) -> AppConfig:
 
     return AppConfig(
         model=trunk_cfg,
-        residual=residual_settings,
         predictor=predictor_settings,
         data=data_settings,
         training=training_settings,
         logging=logging_settings,
+        residual=residual_settings,
+        seed=raw.get("seed"),
     )

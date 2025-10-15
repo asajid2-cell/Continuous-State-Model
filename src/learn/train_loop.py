@@ -1,7 +1,5 @@
-﻿"""
-Prototype training loop for Phase A of the delta-driven learner.
-
-Includes residual projection, EMA consistency, prioritized replay, and AMP support.
+"""
+Training loop for the delta-driven learner with residual, EMA, replay, and AMP support.
 """
 
 from __future__ import annotations
@@ -11,7 +9,6 @@ from typing import Dict, Iterable, Optional
 
 import logging
 import math
-import contextlib
 
 import torch
 from torch import nn
@@ -26,13 +23,25 @@ from src.learn.replay import PrioritizedReplay
 from src.model.trunk import StreamingTrunk
 from src.model.predictor import ForwardPredictor
 
+_NON_FINITE_CLAMP = (-20.0, 20.0)
+
+
+def _sanitize_logits(tensor: torch.Tensor) -> torch.Tensor:
+    tensor = torch.nan_to_num(tensor, nan=0.0, posinf=_NON_FINITE_CLAMP[1], neginf=_NON_FINITE_CLAMP[0])
+    return tensor.clamp(*_NON_FINITE_CLAMP)
+
+
+def _sanitize_probs(tensor: torch.Tensor) -> torch.Tensor:
+    tensor = torch.nan_to_num(tensor, nan=0.0, posinf=1.0, neginf=0.0).clamp_min(1e-8)
+    normalizer = tensor.sum(dim=-1, keepdim=True).clamp_min(1e-8)
+    return tensor / normalizer
+
+
 logger = logging.getLogger(__name__)
 
 
 @dataclass
 class PhaseATrainConfig:
-    """Configuration for the Phase A loop."""
-
     kl_weight: float
     consistency_weight: float
     residual_weight: float
@@ -48,8 +57,6 @@ class PhaseATrainConfig:
 
 
 class PhaseATrainer:
-    """High-level wrapper around the online learning cycle."""
-
     def __init__(
         self,
         cfg: PhaseATrainConfig,
@@ -85,15 +92,16 @@ class PhaseATrainer:
 
         self.use_amp = cfg.use_amp and torch.cuda.is_available()
         self.amp_dtype = cfg.amp_dtype if isinstance(cfg.amp_dtype, torch.dtype) else torch.float16
-        trainable_is_fp32 = all((p.dtype == torch.float32) for p in self._trainable_params if p.requires_grad)
-        scaler_enabled = self.use_amp and cfg.use_grad_scaler and trainable_is_fp32
-        if not scaler_enabled and self.use_amp and cfg.use_grad_scaler:
-            logger.warning("GradScaler disabled (trainable params not float32).")
-        self.scaler = GradScaler(enabled=scaler_enabled) if scaler_enabled else None
-        self.scaler_enabled = scaler_enabled
+        scaler_ready = self.use_amp and cfg.use_grad_scaler and all(
+            p.dtype == torch.float32 for p in self._trainable_params if p.requires_grad
+        )
+        if self.use_amp and cfg.use_grad_scaler and not scaler_ready:
+            logger.warning("GradScaler disabled because trainable parameters are not all float32.")
+        self.scaler = GradScaler(enabled=scaler_ready) if scaler_ready else None
 
         if self.teacher_head is not None:
-            self._sync_teacher(self.ema_teacher if self.ema_teacher is not None else self.predictor)
+            source = self.ema_teacher if self.ema_teacher is not None else self.predictor
+            self._sync_teacher(source)
 
     def train(self, stream: Iterable[StreamRecord], log_interval: int = 100) -> Dict[str, float]:
         logger.info("Starting Phase A training loop")
@@ -136,14 +144,19 @@ class PhaseATrainer:
         current_hidden: Optional[torch.Tensor] = None
 
         with autocast(device_type="cuda", dtype=self.amp_dtype, enabled=self.use_amp):
-            logits_prev = self.predictor(prev_features)["logits"]
+            pred_outputs = self.predictor(prev_features)
+            logits_prev = pred_outputs["logits"]
             if need_hidden:
                 input_ids = torch.tensor([record.tokens], device=self.device, dtype=torch.long)
                 _, aux_cur = self.trunk(input_ids=input_ids, attention_mask=None, use_cache=False)
                 hidden_states = aux_cur["hidden_states"]
                 current_hidden = hidden_states[:, -1, :]
 
-        logits_prev_tensor = logits_prev.float().clamp(-20, 20)
+        logits_prev_tensor = _sanitize_logits(logits_prev.float())
+        if not torch.isfinite(logits_prev_tensor).all():
+            logger.warning("Non-finite logits at t=%s", record.t)
+            return
+
         prediction_loss = losses.prediction_loss(logits_prev_tensor, target_token)
         if not torch.isfinite(prediction_loss):
             logger.warning("Non-finite prediction loss at t=%s", record.t)
@@ -155,9 +168,9 @@ class PhaseATrainer:
 
         if self.teacher_head is not None:
             with torch.no_grad():
-                teacher_logits = self.teacher_head(prev_features.float()).clamp(-20, 20)
+                teacher_state = self.teacher_head(prev_features.float()).clamp(-20, 20)
             student_log_probs = nn.functional.log_softmax(logits_prev_tensor, dim=-1)
-            teacher_log_probs = nn.functional.log_softmax(teacher_logits, dim=-1)
+            teacher_log_probs = nn.functional.log_softmax(teacher_state, dim=-1)
             kl = losses.kl_guard(student_log_probs, teacher_log_probs)
             loss_terms["kl"] = self.cfg.kl_weight * kl
         elif self.frozen_base is not None:
@@ -183,15 +196,25 @@ class PhaseATrainer:
 
         if self.ema_teacher is not None:
             with torch.no_grad():
-                ema_logits = self.ema_teacher(prev_features)["logits"].detach().float().clamp(-20, 20)
+                ema_logits = _sanitize_logits(self.ema_teacher(prev_features)["logits"].detach().float())
             consistency = losses.consistency_loss(logits_prev_tensor, ema_logits)
             loss_terms["consistency"] = self.cfg.consistency_weight * consistency
 
+        for name, value in loss_terms.items():
+            if not torch.isfinite(value):
+                logger.warning("Non-finite %s loss at t=%s", name, record.t)
+                return
+
         total_loss = torch.stack(list(loss_terms.values())).sum()
+        if not torch.isfinite(total_loss):
+            logger.warning("Non-finite total loss at t=%s", record.t)
+            self.optimizer.zero_grad(set_to_none=True)
+            return
+
         gate = self._compute_uncertainty_gate(logits_prev.detach())
         loss_for_backprop = (gate * total_loss) / max(self.cfg.grad_accum_steps, 1)
-
         self._backward(loss_for_backprop)
+
         self._accum_counter += 1
         if self._accum_counter % max(self.cfg.grad_accum_steps, 1) == 0:
             self._optimizer_step()
@@ -207,14 +230,9 @@ class PhaseATrainer:
             self.replay.add(payload, priority=delta_priority)
 
         self.metrics.update_cross_entropy(prediction_loss.detach(), tokens=1)
-        self.metrics.add_metric("gate", float(gate.detach()))
-        logger.debug(
-            "Applied update for t=%s | loss=%.4f gate=%.3f buffer_size=%s",
-            record.t,
-            float(total_loss.detach()),
-            float(gate.detach()),
-            len(self.buffer),
-        )
+        self.metrics.add_metric("gate", float(gate.detach()), accumulate=True)
+        for name, loss_value in loss_terms.items():
+            self.metrics.add_metric(f"loss_{name}", float(loss_value.detach()), accumulate=True)
 
     def _enqueue_prediction(self, record: StreamRecord) -> None:
         input_ids = torch.tensor([record.tokens], device=self.device, dtype=torch.long)
@@ -223,10 +241,11 @@ class PhaseATrainer:
             hidden_states = aux["hidden_states"]
             last_hidden = hidden_states[:, -1, :]
             logits_pred = self.predictor(last_hidden)["logits"]
+
         target_dtype = self.predictor.decoder.weight.dtype
         last_hidden = last_hidden.to(device=self.device, dtype=target_dtype)
-
         predicted_tokens = torch.argmax(logits_pred, dim=-1)
+
         entry = BufferEntry(
             step_key=record.t + 1,
             predicted_tokens=predicted_tokens.detach(),
@@ -247,7 +266,7 @@ class PhaseATrainer:
         if not samples:
             return
 
-        for item in samples:
+        for item, weight in samples:
             payload = item.payload
             features = payload["features"].to(self.device, dtype=self.predictor.decoder.weight.dtype)
             target = payload["target"].to(self.device)
@@ -264,10 +283,16 @@ class PhaseATrainer:
                 delta = (actual_hidden - features).float()
                 loss_terms["residual"] = self.cfg.residual_weight * losses.residual_loss(delta, pred_delta)
 
+            for name, value in loss_terms.items():
+                if not torch.isfinite(value):
+                    logger.warning("Non-finite replay %s loss", name)
+                    return
+
             total_loss = torch.stack(list(loss_terms.values())).sum()
-            gate = self._compute_uncertainty_gate(logits.detach())
-            self._backward(gate * total_loss)
-            self._optimizer_step()
+            weighted_loss = weight * total_loss
+            self._backward(weighted_loss)
+            self._optimizer_step()  # Immediate update from replay sample
+            self.metrics.add_metric("replay_weight", weight, accumulate=True)
 
     def _backward(self, loss: torch.Tensor) -> None:
         if self.scaler is not None:
@@ -295,9 +320,12 @@ class PhaseATrainer:
         if self.teacher_head is None or source is None:
             return
         with torch.no_grad():
-            self.teacher_head.decoder.weight.data.copy_(
-                source.decoder.weight.detach().float().to(self.teacher_head.decoder.weight.device)
-            )
+            state = {
+                k: v.detach().float().to(self.teacher_head.decoder.weight.device)
+                for k, v in source.state_dict().items()
+                if k.startswith("decoder.")
+            }
+            self.teacher_head.decoder.load_state_dict(state, strict=False)
 
     @staticmethod
     def _compute_uncertainty_gate(logits: torch.Tensor) -> torch.Tensor:

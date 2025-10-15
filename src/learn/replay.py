@@ -1,15 +1,12 @@
 ﻿"""
-Prioritized replay buffer for surprise-driven reinforcement of rare events.
-
-Phase A goal: define an interface and minimal implementation so the training
-loop can schedule sampling without yet optimizing for large scale.
+Prioritized replay buffer with importance sampling and without replacement sampling.
 """
 
 from __future__ import annotations
 
 import random
 from dataclasses import dataclass
-from typing import Any, List
+from typing import Any, List, Tuple
 
 
 @dataclass
@@ -21,44 +18,56 @@ class ReplayItem:
 
 
 class PrioritizedReplay:
-    """
-    Naive prioritized replay supporting proportional sampling.
+    """Naive prioritized replay supporting proportional sampling and importance weights."""
 
-    For small capacities the list-based approach is sufficient.
-    We'll swap in a sum-tree once profiling shows it is necessary.
-    """
-
-    def __init__(self, capacity: int, alpha: float = 0.6) -> None:
+    def __init__(self, capacity: int, alpha: float = 0.6, beta: float = 0.0) -> None:
         self.capacity = capacity
         self.alpha = alpha
+        self.beta = beta
         self._items: List[ReplayItem] = []
 
     def add(self, payload: Any, priority: float) -> None:
-        """Insert a new payload with the given priority."""
-
-        priority = max(priority, 1e-6)
-        item = ReplayItem(payload=payload, priority=priority ** self.alpha)
+        priority = max(priority, 1e-6) ** self.alpha
+        item = ReplayItem(payload=payload, priority=priority)
         if len(self._items) >= self.capacity:
             self._items.pop(0)
         self._items.append(item)
 
-    def sample(self, k: int) -> List[ReplayItem]:
-        """Sample k items proportional to their priority."""
-
+    def sample(self, k: int, with_replacement: bool = False) -> List[Tuple[ReplayItem, float]]:
         if not self._items:
             return []
 
-        total = sum(item.priority for item in self._items)
-        samples: List[ReplayItem] = []
-        for _ in range(min(k, len(self._items))):
-            r = random.uniform(0, total)
-            cdf = 0.0
-            for item in self._items:
-                cdf += item.priority
-                if cdf >= r:
-                    samples.append(item)
+        results: List[Tuple[ReplayItem, float]] = []
+        pool: List[ReplayItem] = self._items if with_replacement else list(self._items)
+        total_items = len(self._items)
+
+        for _ in range(min(k, total_items)):
+            if not pool:
+                break
+            total_priority = sum(item.priority for item in pool)
+            if total_priority <= 0:
+                break
+            r = random.uniform(0.0, total_priority)
+            cumulative = 0.0
+            chosen_index = 0
+            chosen_item = pool[0]
+            for idx, item in enumerate(pool):
+                cumulative += item.priority
+                if cumulative >= r:
+                    chosen_index = idx
+                    chosen_item = item
                     break
-        return samples
+
+            probability = chosen_item.priority / total_priority if total_priority > 0 else 0.0
+            weight = 1.0
+            if self.beta > 0 and probability > 0:
+                weight = (total_items * probability) ** (-self.beta)
+            results.append((chosen_item, weight))
+
+            if not with_replacement:
+                pool.pop(chosen_index)
+
+        return results
 
     def __len__(self) -> int:
         return len(self._items)

@@ -1,0 +1,33 @@
+# Byte-compiled / cache directories
+__pycache__/
+*.py[cod]
+*.pyo
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# Build & packaging artifacts
+build/
+dist/
+*.egg-info/
+
+# Logs and checkpoints
+*.log
+checkpoints/
+models/
+*.pt
+*.ckpt
+*.bin
+*.safetensors
+
+# IDE/editor cruft
+.vscode/
+.idea/
+Untitled-1.md
+~$*
+
+# Environment/config secrets
+.env

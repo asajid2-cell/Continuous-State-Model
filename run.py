@@ -1,19 +1,21 @@
 ﻿"""
-Run a quick integration check of the continual-learning stack.
-
-Loads the config, instantiates the model, runs a short stream training pass, and
-optionally performs a chat smoke test.
+Smoke-test harness for the continual-learning stack.
 """
 
 from __future__ import annotations
 
 import argparse
+import dataclasses
 import logging
+import random
 import time
-from dataclasses import replace
 from pathlib import Path
+from typing import Optional
 
+import numpy as np
 import torch
+
+torch.set_float32_matmul_precision("medium")
 
 from src.config import AppConfig, load_app_config
 from src.data.stream import stream_loader_factory
@@ -23,40 +25,62 @@ from src.model.factory import create_predictor, create_residual, create_teacher,
 
 LOG = logging.getLogger("delta_stream.run")
 
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Continuous-state model smoke test")
     parser.add_argument("--config", type=Path, default=Path("configs/base.yaml"))
     parser.add_argument("--log-level", type=str, default="INFO")
-    parser.add_argument("--max-steps", type=int, default=32, help="Override training.max_steps for the smoke test")
-    parser.add_argument("--chat-prompt", type=str, default=None, help="Optional prompt to run after training")
+    parser.add_argument("--max-steps", type=int, default=32)
+    parser.add_argument("--chat-prompt", type=str, default=None)
+    parser.add_argument("--checkpoint-dir", type=Path, default=Path("checkpoints"))
     return parser.parse_args()
 
 
-def _resolve_amp(dtype_name: str) -> torch.dtype:
-    try:
-        return getattr(torch, dtype_name)
-    except AttributeError:
-        LOG.warning("Unknown AMP dtype '%s', defaulting to float16", dtype_name)
-        return torch.float16
+def set_global_seed(seed: Optional[int]) -> None:
+    if seed is None:
+        return
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
+    LOG.info("Global seed set to %s", seed)
 
 
-def _summarize_devices() -> None:
+def _resolve_amp_dtype(name: str) -> torch.dtype:
+    return getattr(torch, name, torch.float16)
+
+
+def _summarise_device() -> None:
     if torch.cuda.is_available():
         LOG.info("CUDA device: %s", torch.cuda.get_device_name(torch.cuda.current_device()))
     else:
         LOG.info("CUDA not available; running on CPU")
 
 
-def _maybe_chat(trunk, prompt: str | None) -> None:
+def _maybe_chat(trunk, prompt: Optional[str]) -> None:
     if not prompt:
         return
-    LOG.info("Running chat prompt: %s", prompt)
     messages = [
         {"role": "system", "content": "You are a helpful assistant."},
         {"role": "user", "content": prompt},
     ]
     reply = trunk.chat(messages, max_new_tokens=128)
     LOG.info("Chat reply: %s", reply)
+
+
+def _save_checkpoint(path: Path, trunk, predictor, residual_head, optimizer) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    state = {
+        "predictor": predictor.state_dict(),
+        "trunk": trunk.base_model.state_dict(),
+        "optimizer": optimizer.state_dict(),
+        "residual": residual_head.state_dict() if residual_head is not None else None,
+    }
+    torch.save(state, path)
+    LOG.info("Checkpoint saved to %s", path)
 
 
 def main() -> None:
@@ -66,17 +90,17 @@ def main() -> None:
         format="%(asctime)s | %(name)s | %(levelname)s | %(message)s",
     )
 
-    _summarize_devices()
+    _summarise_device()
 
     if not args.config.exists():
         raise FileNotFoundError(f"Config not found: {args.config}")
 
-    LOG.info("Loading config from %s", args.config)
     app_cfg: AppConfig = load_app_config(args.config)
+    set_global_seed(app_cfg.seed)
 
     training_cfg = app_cfg.training
-    if args.max_steps is not None and args.max_steps > 0:
-        training_cfg = replace(training_cfg, max_steps=args.max_steps)
+    if args.max_steps:
+        training_cfg = dataclasses.replace(training_cfg, max_steps=args.max_steps)
         LOG.info("Overriding max_steps to %s for smoke test", args.max_steps)
 
     LOG.info("Initialising trunk (model=%s)", app_cfg.model.base_name)
@@ -103,19 +127,24 @@ def main() -> None:
 
     teacher_head = None
     if training_cfg.kl_weight > 0:
-        teacher_source = ema_teacher if ema_teacher is not None else predictor
-        teacher_head = create_teacher(teacher_source)
+        teacher_head = create_teacher(ema_teacher if ema_teacher is not None else predictor)
         LOG.info("Teacher head initialised for KL regularisation")
 
     replay_cfg = training_cfg.replay
-    replay = None
+    replay_buffer = None
     if replay_cfg.interval > 0 and replay_cfg.batch > 0 and replay_cfg.capacity > 0:
-        replay = PrioritizedReplay(capacity=replay_cfg.capacity, alpha=replay_cfg.alpha)
-        LOG.info("Replay buffer ready (capacity=%s, interval=%s, batch=%s)", replay_cfg.capacity, replay_cfg.interval, replay_cfg.batch)
+        replay_buffer = PrioritizedReplay(capacity=replay_cfg.capacity, alpha=replay_cfg.alpha, beta=replay_cfg.beta)
+        LOG.info(
+            "Replay buffer ready (capacity=%s, interval=%s, batch=%s, beta=%.2f)",
+            replay_cfg.capacity,
+            replay_cfg.interval,
+            replay_cfg.batch,
+            replay_cfg.beta,
+        )
 
     amp_settings = training_cfg.amp
     amp_enabled = bool(amp_settings.enabled and torch.cuda.is_available())
-    amp_dtype = _resolve_amp(amp_settings.dtype)
+    amp_dtype = _resolve_amp_dtype(amp_settings.dtype)
 
     optimizer = torch.optim.AdamW(
         [
@@ -150,7 +179,7 @@ def main() -> None:
         residual_head=residual_head,
         teacher_head=teacher_head,
         ema_teacher=ema_teacher,
-        replay=replay,
+        replay=replay_buffer,
     )
 
     stream_iterable = stream_loader_factory(
@@ -162,7 +191,12 @@ def main() -> None:
     start = time.time()
     metrics = trainer.train(stream_iterable, log_interval=app_cfg.logging.log_interval)
     elapsed = time.time() - start
-    LOG.info("Smoke test finished in %.2fs | metrics=%s", elapsed, metrics)
+    LOG.info("Smoke test finished in %.2fs", elapsed)
+    LOG.info("Metrics: %s", metrics)
+
+    if args.checkpoint_dir:
+        checkpoint_path = args.checkpoint_dir / "last.pt"
+        _save_checkpoint(checkpoint_path, trunk, predictor, residual_head, optimizer)
 
     _maybe_chat(trunk, args.chat_prompt)
 

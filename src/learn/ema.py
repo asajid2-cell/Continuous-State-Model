@@ -1,8 +1,5 @@
-"""
-Exponential moving average (EMA) utilities for maintaining a teacher model.
-
-Phase A implementation only needs a lightweight helper to update parameters
-between the student and teacher copies of the trunk.
+﻿"""
+EMA utilities for maintaining teacher models.
 """
 
 from __future__ import annotations
@@ -12,13 +9,12 @@ from typing import Iterable
 import torch
 
 
-@torch.no_grad()
 def update_ema(student: torch.nn.Module, teacher: torch.nn.Module, decay: float) -> None:
-    """Update teacher parameters with EMA of student parameters."""
-
-    student_params: Iterable[torch.Tensor] = student.parameters()
-    teacher_params: Iterable[torch.Tensor] = teacher.parameters()
-
-    for s_param, t_param in zip(student_params, teacher_params):
-        t_param.lerp_(s_param, 1.0 - decay)
-
+    with torch.no_grad():
+        for student_param, teacher_param in zip(student.parameters(), teacher.parameters()):
+            if not teacher_param.requires_grad:
+                continue
+            source = student_param.detach()
+            if teacher_param.dtype != source.dtype:
+                source = source.to(teacher_param.dtype)
+            teacher_param.data.mul_(decay).add_(source, alpha=1.0 - decay)

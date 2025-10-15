@@ -1,4 +1,4 @@
-# Base configuration for delta-driven dual-stream LLM
+﻿seed: 1337
 
 model:
   base_name: TinyLlama/TinyLlama-1.1B-Chat-v1.0
@@ -6,7 +6,7 @@ model:
   quantization: bitsandbytes-4bit
   tokenizer_name: TinyLlama/TinyLlama-1.1B-Chat-v1.0
   padding_side: left
-  torch_dtype: float32
+  torch_dtype: float16
   residual:
     rank: 64
   lora:
@@ -47,6 +47,7 @@ training:
     batch: 4
     capacity: 4096
     alpha: 0.6
+    beta: 0.4
   amp:
     enabled: true
     dtype: float16
