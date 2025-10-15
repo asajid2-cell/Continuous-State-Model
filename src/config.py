@@ -1,4 +1,4 @@
-"""
+﻿"""
 Configuration loader for the delta-driven dual-stream project.
 
 Reads YAML config files and instantiates strongly typed dataclasses used across
@@ -7,13 +7,20 @@ the training stack.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 
 import yaml
 
 from src.model.trunk import LoraSettings, TrunkConfig
+
+
+@dataclass
+class ResidualSettings:
+    """Configuration for the residual projector head."""
+
+    rank: int = 32
 
 
 @dataclass
@@ -34,6 +41,16 @@ class DataSettings:
 
 
 @dataclass
+class ReplaySettings:
+    """Prioritized replay configuration."""
+
+    interval: int = 0
+    batch: int = 0
+    capacity: int = 0
+    alpha: float = 0.6
+
+
+@dataclass
 class TrainingSettings:
     """Optimization hyper-parameters for adapters and predictor."""
 
@@ -46,6 +63,7 @@ class TrainingSettings:
     consistency_weight: float
     residual_weight: float
     max_steps: int = 0
+    replay: ReplaySettings = field(default_factory=ReplaySettings)
 
 
 @dataclass
@@ -63,6 +81,7 @@ class AppConfig:
     """Top-level configuration bundle."""
 
     model: TrunkConfig
+    residual: Optional[ResidualSettings]
     predictor: PredictorSettings
     data: DataSettings
     training: TrainingSettings
@@ -94,6 +113,8 @@ def load_app_config(path: Path) -> AppConfig:
         cache_dir=model_cfg.get("cache_dir"),
         lora=lora,
     )
+    residual_cfg = model_cfg.get("residual")
+    residual_settings = ResidualSettings(**residual_cfg) if residual_cfg else None
 
     predictor_cfg = raw.get("predictor", {})
     predictor_settings = PredictorSettings(
@@ -109,6 +130,13 @@ def load_app_config(path: Path) -> AppConfig:
     )
 
     training_cfg = raw.get("training", {})
+    replay_cfg = training_cfg.get("replay", {})
+    replay_settings = ReplaySettings(
+        interval=int(replay_cfg.get("interval", 0)),
+        batch=int(replay_cfg.get("batch", 0)),
+        capacity=int(replay_cfg.get("capacity", 0)),
+        alpha=float(replay_cfg.get("alpha", 0.6)),
+    )
     training_settings = TrainingSettings(
         adapter_lr=float(training_cfg["adapter_lr"]),
         predictor_lr=float(training_cfg["predictor_lr"]),
@@ -119,6 +147,7 @@ def load_app_config(path: Path) -> AppConfig:
         consistency_weight=float(training_cfg["consistency_weight"]),
         residual_weight=float(training_cfg["residual_weight"]),
         max_steps=int(training_cfg.get("max_steps", 0)),
+        replay=replay_settings,
     )
 
     logging_cfg = raw.get("logging", {})
@@ -131,6 +160,7 @@ def load_app_config(path: Path) -> AppConfig:
 
     return AppConfig(
         model=trunk_cfg,
+        residual=residual_settings,
         predictor=predictor_settings,
         data=data_settings,
         training=training_settings,

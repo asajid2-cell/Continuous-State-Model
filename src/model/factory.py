@@ -10,6 +10,7 @@ import logging
 import torch
 
 from .predictor import ForwardPredictor, PredictorConfig
+from .residual import ResidualProjector
 from .trunk import StreamingTrunk, TrunkConfig
 
 logger = logging.getLogger(__name__)
@@ -60,3 +61,14 @@ def create_predictor(trunk: StreamingTrunk, use_variance_head: bool = False, dev
         predictor.decoder.weight.dtype,
     )
     return predictor
+
+
+
+def create_residual(trunk: StreamingTrunk, rank: int) -> ResidualProjector:
+    """Instantiate a residual projector matching the trunk hidden size."""
+
+    hidden_size = trunk.base_model.config.hidden_size
+    projector = ResidualProjector(hidden_size=hidden_size, rank=rank)
+    base_param = next(trunk.base_model.parameters())
+    projector = projector.to(device=base_param.device, dtype=base_param.dtype)
+    return projector

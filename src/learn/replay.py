@@ -1,4 +1,4 @@
-"""
+﻿"""
 Prioritized replay buffer for surprise-driven reinforcement of rare events.
 
 Phase A goal: define an interface and minimal implementation so the training
@@ -7,17 +7,16 @@ loop can schedule sampling without yet optimizing for large scale.
 
 from __future__ import annotations
 
-import bisect
 import random
 from dataclasses import dataclass
-from typing import List, Tuple
+from typing import Any, List
 
 
 @dataclass
 class ReplayItem:
     """Payload stored in replay."""
 
-    payload: Tuple
+    payload: Any
     priority: float
 
 
@@ -34,7 +33,7 @@ class PrioritizedReplay:
         self.alpha = alpha
         self._items: List[ReplayItem] = []
 
-    def add(self, payload: Tuple, priority: float) -> None:
+    def add(self, payload: Any, priority: float) -> None:
         """Insert a new payload with the given priority."""
 
         priority = max(priority, 1e-6)
@@ -63,4 +62,3 @@ class PrioritizedReplay:
 
     def __len__(self) -> int:
         return len(self._items)
-

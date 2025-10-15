@@ -7,6 +7,8 @@ model:
   tokenizer_name: TinyLlama/TinyLlama-1.1B-Chat-v1.0
   padding_side: left
   torch_dtype: float16
+  residual:
+    rank: 64
   lora:
     r: 8
     alpha: 16
@@ -38,6 +40,11 @@ training:
   kl_weight: 0.02
   consistency_weight: 0.1
   residual_weight: 0.05
+  replay:
+    interval: 8
+    batch: 4
+    capacity: 4096
+    alpha: 0.6
   max_steps: 200
 
 logging:
